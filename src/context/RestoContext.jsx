@@ -10,9 +10,14 @@ import {
 
 const RestoContext = createContext(null);
 
+// Inter-port Broadcast Channel Engine (Syncs localhost:3000, localhost:3001, localhost:3002)
+const broadcastChannel = typeof BroadcastChannel !== "undefined"
+  ? new BroadcastChannel("truffles_resto_channel")
+  : null;
+
 export const RestoProvider = ({ children }) => {
   const [currentBranch, setCurrentBranch] = useState(INITIAL_BRANCHES[0]);
-  const [activeTab, setActiveTab] = useState("table_map"); // table_map | live_orders | billing | menu_manager | analytics
+  const [activeTab, setActiveTab] = useState("table_map");
   const [selectedTableForBilling, setSelectedTableForBilling] = useState(null);
 
   const [tables, setTables] = useState(INITIAL_TABLES);
@@ -21,37 +26,69 @@ export const RestoProvider = ({ children }) => {
   const [activeOrders, setActiveOrders] = useState(INITIAL_ACTIVE_ORDERS);
   const [paidTransactions, setPaidTransactions] = useState(INITIAL_PAID_TRANSACTIONS);
 
-  // Auto calculate active order totals on table state
-  const syncTableTotals = (currentOrders, currentTables) => {
-    return currentTables.map((table) => {
-      const activeOrd = currentOrders.find(
-        (o) => o.tableId === table.id && o.status !== "Cancelled" && o.status !== "Paid"
-      );
-      if (activeOrd) {
-        const total = activeOrd.items.reduce(
-          (sum, item) => sum + item.price * item.qty,
-          0
-        );
-        return {
-          ...table,
-          orderId: activeOrd.id,
-          activeOrderTotal: total,
-          // Sync status if table is vacant but has an order
-          status: table.status === "vacant" ? "occupied" : table.status
-        };
-      } else {
-        return table;
-      }
-    });
-  };
+  // Real-time Inter-port Sync Listener
+  useEffect(() => {
+    if (!broadcastChannel) return;
 
-  // Switch to billing for a specific table
+    const handleBroadcast = (event) => {
+      const data = event.data;
+      if (!data || !data.type) return;
+
+      if (data.type === "NEW_ORDER") {
+        setActiveOrders((prev) => {
+          if (prev.some((o) => o.id === data.order.id)) return prev;
+          return [data.order, ...prev];
+        });
+
+        setTables((prev) =>
+          prev.map((t) => {
+            if (t.id === data.tableId) {
+              const total = data.order.items.reduce((s, i) => s + i.price * i.qty, 0);
+              return {
+                ...t,
+                status: "occupied",
+                seatedTime: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                orderId: data.order.id,
+                activeOrderTotal: total
+              };
+            }
+            return t;
+          })
+        );
+      } else if (data.type === "UPDATE_ORDER_STATUS") {
+        setActiveOrders((prev) =>
+          prev.map((o) => (o.id === data.orderId ? { ...o, status: data.newStatus } : o))
+        );
+
+        if (data.newStatus === "Payment Pending") {
+          const target = activeOrders.find((o) => o.id === data.orderId);
+          if (target) {
+            setTables((prev) =>
+              prev.map((t) => (t.id === target.tableId ? { ...t, status: "awaiting_payment" } : t))
+            );
+          }
+        }
+      } else if (data.type === "PAY_ORDER") {
+        setActiveOrders((prev) => prev.filter((o) => o.id !== data.orderId));
+        setTables((prev) =>
+          prev.map((t) => {
+            if (t.id === data.tableId) {
+              return { ...t, status: "vacant", guests: 0, seatedTime: null, orderId: null, activeOrderTotal: 0 };
+            }
+            return t;
+          })
+        );
+      }
+    };
+
+    broadcastChannel.onmessage = handleBroadcast;
+  }, [activeOrders]);
+
   const goToBillingForTable = (tableId) => {
     setSelectedTableForBilling(tableId);
     setActiveTab("billing");
   };
 
-  // Change Table Status
   const updateTableStatus = (tableId, newStatus) => {
     setTables((prev) =>
       prev.map((t) => {
@@ -70,7 +107,6 @@ export const RestoProvider = ({ children }) => {
     );
   };
 
-  // Create new order
   const createOrder = ({ tableId, items, guests = 2, notes = "" }) => {
     const newOrderId = `ORD-${Math.floor(100 + Math.random() * 900)}`;
     const newOrder = {
@@ -102,16 +138,23 @@ export const RestoProvider = ({ children }) => {
       })
     );
 
+    // Broadcast NEW_ORDER event to Port 3000 & Port 3002
+    if (broadcastChannel) {
+      broadcastChannel.postMessage({
+        type: "NEW_ORDER",
+        order: newOrder,
+        tableId
+      });
+    }
+
     return newOrderId;
   };
 
-  // Update order status
   const updateOrderStatus = (orderId, newStatus) => {
     setActiveOrders((prev) =>
       prev.map((o) => (o.id === orderId ? { ...o, status: newStatus } : o))
     );
 
-    // If order status is Payment Pending, set table status to awaiting_payment
     const targetOrder = activeOrders.find((o) => o.id === orderId);
     if (targetOrder && newStatus === "Payment Pending") {
       setTables((prev) =>
@@ -120,9 +163,17 @@ export const RestoProvider = ({ children }) => {
         )
       );
     }
+
+    // Broadcast UPDATE_ORDER_STATUS event to Port 3000 & Port 3002
+    if (broadcastChannel) {
+      broadcastChannel.postMessage({
+        type: "UPDATE_ORDER_STATUS",
+        orderId,
+        newStatus
+      });
+    }
   };
 
-  // Cancel order
   const cancelOrder = (orderId) => {
     const targetOrder = activeOrders.find((o) => o.id === orderId);
     if (!targetOrder) return;
@@ -132,21 +183,13 @@ export const RestoProvider = ({ children }) => {
     setTables((prev) =>
       prev.map((t) => {
         if (t.id === targetOrder.tableId) {
-          return {
-            ...t,
-            status: "vacant",
-            guests: 0,
-            seatedTime: null,
-            orderId: null,
-            activeOrderTotal: 0
-          };
+          return { ...t, status: "vacant", guests: 0, seatedTime: null, orderId: null, activeOrderTotal: 0 };
         }
         return t;
       })
     );
   };
 
-  // Bump priority
   const bumpOrderPriority = (orderId) => {
     setActiveOrders((prev) => {
       const index = prev.findIndex((o) => o.id === orderId);
@@ -158,12 +201,10 @@ export const RestoProvider = ({ children }) => {
     });
   };
 
-  // Pay order
   const payOrder = (orderId, paymentDetails) => {
     const targetOrder = activeOrders.find((o) => o.id === orderId);
     if (!targetOrder) return;
 
-    // Record completed transaction
     const newTx = {
       id: `TX-${Math.floor(1000 + Math.random() * 9000)}`,
       orderId: targetOrder.id,
@@ -179,21 +220,12 @@ export const RestoProvider = ({ children }) => {
 
     setPaidTransactions((prev) => [newTx, ...prev]);
 
-    // Remove from active orders
     setActiveOrders((prev) => prev.filter((o) => o.id !== orderId));
 
-    // Update table status to vacant (or needs_cleaning)
     setTables((prev) =>
       prev.map((t) => {
         if (t.id === targetOrder.tableId) {
-          return {
-            ...t,
-            status: "vacant",
-            guests: 0,
-            seatedTime: null,
-            orderId: null,
-            activeOrderTotal: 0
-          };
+          return { ...t, status: "vacant", guests: 0, seatedTime: null, orderId: null, activeOrderTotal: 0 };
         }
         return t;
       })
@@ -202,23 +234,25 @@ export const RestoProvider = ({ children }) => {
     if (selectedTableForBilling === targetOrder.tableId) {
       setSelectedTableForBilling(null);
     }
+
+    // Broadcast PAY_ORDER event
+    if (broadcastChannel) {
+      broadcastChannel.postMessage({
+        type: "PAY_ORDER",
+        orderId,
+        tableId: targetOrder.tableId
+      });
+    }
   };
 
   // Category CRUD
   const addCategory = (categoryName) => {
-    const newCat = {
-      id: `cat-${Date.now()}`,
-      name: categoryName,
-      icon: "Utensils",
-      sortOrder: categories.length + 1
-    };
+    const newCat = { id: `cat-${Date.now()}`, name: categoryName, icon: "Utensils", sortOrder: categories.length + 1 };
     setCategories((prev) => [...prev, newCat]);
   };
 
   const editCategory = (categoryId, newName) => {
-    setCategories((prev) =>
-      prev.map((c) => (c.id === categoryId ? { ...c, name: newName } : c))
-    );
+    setCategories((prev) => prev.map((c) => (c.id === categoryId ? { ...c, name: newName } : c)));
   };
 
   const deleteCategory = (categoryId) => {
@@ -229,7 +263,6 @@ export const RestoProvider = ({ children }) => {
   const reorderCategory = (index, direction) => {
     const targetIndex = direction === "up" ? index - 1 : index + 1;
     if (targetIndex < 0 || targetIndex >= categories.length) return;
-
     const newCategories = [...categories];
     const temp = newCategories[index];
     newCategories[index] = newCategories[targetIndex];
@@ -239,17 +272,12 @@ export const RestoProvider = ({ children }) => {
 
   // Menu Item CRUD
   const addMenuItem = (itemData) => {
-    const newItem = {
-      id: `item-${Date.now()}`,
-      ...itemData
-    };
+    const newItem = { id: `item-${Date.now()}`, ...itemData };
     setMenuItems((prev) => [newItem, ...prev]);
   };
 
   const editMenuItem = (itemId, itemData) => {
-    setMenuItems((prev) =>
-      prev.map((m) => (m.id === itemId ? { ...m, ...itemData } : m))
-    );
+    setMenuItems((prev) => prev.map((m) => (m.id === itemId ? { ...m, ...itemData } : m)));
   };
 
   const deleteMenuItem = (itemId) => {
@@ -257,9 +285,7 @@ export const RestoProvider = ({ children }) => {
   };
 
   const toggleItemAvailability = (itemId) => {
-    setMenuItems((prev) =>
-      prev.map((m) => (m.id === itemId ? { ...m, isAvailable: !m.isAvailable } : m))
-    );
+    setMenuItems((prev) => prev.map((m) => (m.id === itemId ? { ...m, isAvailable: !m.isAvailable } : m)));
   };
 
   return (
